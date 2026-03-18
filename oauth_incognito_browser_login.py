@@ -1034,52 +1034,16 @@ def print_batch_summary(
 def run_exclusive_oauth_flow(
     args: argparse.Namespace,
     account: Account,
-    chrome_path: Path,
+    management_page,
+    context,
     auth_dir: Path,
     duckmail_token: str,
     seen_duckmail_ids: set[str],
 ) -> Path | None:
     auth_snapshot = snapshot_auth_files(auth_dir)
-    chrome_process = None
-    profile_dir = None
-    browser = None
-    playwright = None
     auth_page = None
 
     try:
-        port = find_free_port()
-        chrome_process, profile_dir = launch_chrome(
-            chrome_path,
-            port,
-            DEFAULT_MANAGEMENT_PAGE,
-            headless=args.headless,
-        )
-        wait_for_cdp(port)
-
-        playwright = sync_playwright().start()
-        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
-        if not browser.contexts:
-            raise RuntimeError("No Chrome context found after connecting over CDP")
-        context = browser.contexts[0]
-
-        management_page = None
-        deadline = time.time() + 30
-        while time.time() < deadline and management_page is None:
-            for page in context.pages:
-                if "management.html" in page.url or page.url in {"about:blank", ""}:
-                    management_page = page
-                    break
-            if management_page is None:
-                time.sleep(0.2)
-        if management_page is None:
-            management_page = context.new_page()
-            management_page.goto(DEFAULT_MANAGEMENT_PAGE, wait_until="domcontentloaded", timeout=30000)
-        else:
-            management_page.bring_to_front()
-            if management_page.url in {"about:blank", ""}:
-                management_page.goto(DEFAULT_MANAGEMENT_PAGE, wait_until="domcontentloaded", timeout=30000)
-
-        ensure_management_login(management_page, args.management_key)
         open_oauth_page(management_page)
         auth_url = click_codex_oauth_login(management_page)
         state = urllib.parse.parse_qs(urllib.parse.urlsplit(auth_url).query).get("state", [""])[0]
@@ -1127,29 +1091,6 @@ def run_exclusive_oauth_flow(
             except Exception:
                 pass
         raise
-    finally:
-        if browser is not None:
-            try:
-                browser.close()
-            except Exception:
-                pass
-        if playwright is not None:
-            try:
-                playwright.stop()
-            except Exception:
-                pass
-        if not args.keep_browser and chrome_process is not None:
-            try:
-                chrome_process.terminate()
-            except Exception:
-                pass
-        if profile_dir and profile_dir.exists():
-            for _ in range(20):
-                try:
-                    shutil.rmtree(profile_dir)
-                    break
-                except Exception:
-                    time.sleep(0.25)
 
 
 def run_account_flow(args: argparse.Namespace, account: Account, chrome_path: Path) -> Path | None:
@@ -1163,20 +1104,86 @@ def run_account_flow(args: argparse.Namespace, account: Account, chrome_path: Pa
         seen_duckmail_ids = snapshot_duckmail_message_ids(duckmail_token, args.duckmail_api_base)
         log(f"DuckMail token is ready; existing messages: {len(seen_duckmail_ids)}")
 
-    log(f"Waiting for exclusive Codex OAuth slot: line {account.line_number} / {mask_email(account.email)}")
-    with _OAUTH_SLOT_LOCK:
-        log(f"Acquired exclusive Codex OAuth slot: line {account.line_number} / {mask_email(account.email)}")
+    chrome_process = None
+    profile_dir = None
+    browser = None
+    playwright = None
+
+    try:
+        port = find_free_port()
+        chrome_process, profile_dir = launch_chrome(
+            chrome_path,
+            port,
+            DEFAULT_MANAGEMENT_PAGE,
+            headless=args.headless,
+        )
+        wait_for_cdp(port)
+
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        if not browser.contexts:
+            raise RuntimeError("No Chrome context found after connecting over CDP")
+        context = browser.contexts[0]
+
+        management_page = None
+        deadline = time.time() + 30
+        while time.time() < deadline and management_page is None:
+            for page in context.pages:
+                if "management.html" in page.url or page.url in {"about:blank", ""}:
+                    management_page = page
+                    break
+            if management_page is None:
+                time.sleep(0.2)
+        if management_page is None:
+            management_page = context.new_page()
+            management_page.goto(DEFAULT_MANAGEMENT_PAGE, wait_until="domcontentloaded", timeout=30000)
+        else:
+            management_page.bring_to_front()
+            if management_page.url in {"about:blank", ""}:
+                management_page.goto(DEFAULT_MANAGEMENT_PAGE, wait_until="domcontentloaded", timeout=30000)
+
+        ensure_management_login(management_page, args.management_key)
+        open_oauth_page(management_page)
+        log(f"Prepared browser and management OAuth page: line {account.line_number} / {mask_email(account.email)}")
+        log(f"Waiting for exclusive Codex OAuth slot: line {account.line_number} / {mask_email(account.email)}")
+
+        with _OAUTH_SLOT_LOCK:
+            log(f"Acquired exclusive Codex OAuth slot: line {account.line_number} / {mask_email(account.email)}")
+            try:
+                return run_exclusive_oauth_flow(
+                    args=args,
+                    account=account,
+                    management_page=management_page,
+                    context=context,
+                    auth_dir=auth_dir,
+                    duckmail_token=duckmail_token,
+                    seen_duckmail_ids=seen_duckmail_ids,
+                )
+            finally:
+                log(f"Released exclusive Codex OAuth slot: line {account.line_number} / {mask_email(account.email)}")
+    finally:
         try:
-            return run_exclusive_oauth_flow(
-                args=args,
-                account=account,
-                chrome_path=chrome_path,
-                auth_dir=auth_dir,
-                duckmail_token=duckmail_token,
-                seen_duckmail_ids=seen_duckmail_ids,
-            )
-        finally:
-            log(f"Released exclusive Codex OAuth slot: line {account.line_number} / {mask_email(account.email)}")
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+        try:
+            if playwright is not None:
+                playwright.stop()
+        except Exception:
+            pass
+        if not args.keep_browser and chrome_process is not None:
+            try:
+                chrome_process.terminate()
+            except Exception:
+                pass
+        if profile_dir and profile_dir.exists():
+            for _ in range(20):
+                try:
+                    shutil.rmtree(profile_dir)
+                    break
+                except Exception:
+                    time.sleep(0.25)
 
 
 def process_account_task(
