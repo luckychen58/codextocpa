@@ -48,6 +48,7 @@ PROCESSED_PREFIX = "已处理@"
 _LOG_LOCK = threading.Lock()
 _ACTIVE_TASK_LOCK = threading.Lock()
 _ACTIVE_TASKS = 0
+_OAUTH_SLOT_LOCK = threading.Lock()
 
 
 @dataclass
@@ -1030,18 +1031,15 @@ def print_batch_summary(
     print("=" * 52, flush=True)
 
 
-def run_account_flow(args: argparse.Namespace, account: Account, chrome_path: Path) -> Path | None:
-    auth_dir = Path(args.auth_dir)
+def run_exclusive_oauth_flow(
+    args: argparse.Namespace,
+    account: Account,
+    chrome_path: Path,
+    auth_dir: Path,
+    duckmail_token: str,
+    seen_duckmail_ids: set[str],
+) -> Path | None:
     auth_snapshot = snapshot_auth_files(auth_dir)
-    duckmail_token = ""
-    seen_duckmail_ids: set[str] = set()
-
-    log(f"Using account: {mask_email(account.email)}")
-    if account.mail_password:
-        duckmail_token = duckmail_get_token(account.email, account.mail_password, args.duckmail_api_base)
-        seen_duckmail_ids = snapshot_duckmail_message_ids(duckmail_token, args.duckmail_api_base)
-        log(f"DuckMail token is ready; existing messages: {len(seen_duckmail_ids)}")
-
     chrome_process = None
     profile_dir = None
     browser = None
@@ -1152,6 +1150,33 @@ def run_account_flow(args: argparse.Namespace, account: Account, chrome_path: Pa
                     break
                 except Exception:
                     time.sleep(0.25)
+
+
+def run_account_flow(args: argparse.Namespace, account: Account, chrome_path: Path) -> Path | None:
+    auth_dir = Path(args.auth_dir)
+    duckmail_token = ""
+    seen_duckmail_ids: set[str] = set()
+
+    log(f"Using account: {mask_email(account.email)}")
+    if account.mail_password:
+        duckmail_token = duckmail_get_token(account.email, account.mail_password, args.duckmail_api_base)
+        seen_duckmail_ids = snapshot_duckmail_message_ids(duckmail_token, args.duckmail_api_base)
+        log(f"DuckMail token is ready; existing messages: {len(seen_duckmail_ids)}")
+
+    log(f"Waiting for exclusive Codex OAuth slot: line {account.line_number} / {mask_email(account.email)}")
+    with _OAUTH_SLOT_LOCK:
+        log(f"Acquired exclusive Codex OAuth slot: line {account.line_number} / {mask_email(account.email)}")
+        try:
+            return run_exclusive_oauth_flow(
+                args=args,
+                account=account,
+                chrome_path=chrome_path,
+                auth_dir=auth_dir,
+                duckmail_token=duckmail_token,
+                seen_duckmail_ids=seen_duckmail_ids,
+            )
+        finally:
+            log(f"Released exclusive Codex OAuth slot: line {account.line_number} / {mask_email(account.email)}")
 
 
 def process_account_task(
