@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.png
+*.jpg
+*.jpeg
+*.log
+
+auths/
+codex_browser_profiles/
+.codex-app-profiles/
+.codex-profiles/
+
+registered_accounts.txt
+*.json
+!.vscode/settings.json
