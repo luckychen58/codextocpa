@@ -63,6 +63,14 @@ class Account:
     failed: bool = False
 
 
+class AccountTaskError(RuntimeError):
+    def __init__(self, account: Account, original_exception: Exception, elapsed_seconds: float) -> None:
+        super().__init__(str(original_exception))
+        self.account = account
+        self.original_exception = original_exception
+        self.elapsed_seconds = elapsed_seconds
+
+
 def mask_email(value: str) -> str:
     if "@" not in value:
         return "***"
@@ -76,6 +84,17 @@ def log(message: str) -> None:
     prefix = f"[{thread_name}] " if thread_name != "MainThread" else ""
     with _LOG_LOCK:
         print(f"[{now}] {prefix}{message}", flush=True)
+
+
+def format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 
 def reset_active_task_counter() -> None:
@@ -253,6 +272,18 @@ def launch_chrome(
     headless: bool = False,
 ) -> tuple[subprocess.Popen[bytes], Path]:
     profile_dir = Path(tempfile.mkdtemp(prefix="codex-incognito-"))
+    default_profile_dir = profile_dir / "Default"
+    default_profile_dir.mkdir(parents=True, exist_ok=True)
+    preferences_path = default_profile_dir / "Preferences"
+    preferences = {
+        "credentials_enable_service": False,
+        "autofill": {"enabled": False},
+        "profile": {
+            "password_manager_enabled": False,
+            "password_manager_leak_detection": False,
+        },
+    }
+    preferences_path.write_text(json.dumps(preferences, ensure_ascii=False), encoding="utf-8")
     command = [
         str(chrome_path),
         f"--remote-debugging-port={port}",
@@ -262,6 +293,8 @@ def launch_chrome(
         "--no-default-browser-check",
         "--disable-background-networking",
         "--disable-sync",
+        "--disable-save-password-bubble",
+        "--disable-features=PasswordManagerOnboarding",
     ]
     if headless:
         command.extend(
@@ -479,7 +512,15 @@ def wait_for_duckmail_code(
                     code = extract_verification_code(content)
             if code and ("openai" in sender_address.lower() or "chatgpt code" in subject.lower()):
                 return code, known_ids
-        time.sleep(3.0)
+        remaining = deadline - time.time()
+        elapsed = timeout_seconds - remaining
+        if elapsed < 15:
+            sleep_seconds = 0.8
+        elif elapsed < 40:
+            sleep_seconds = 1.5
+        else:
+            sleep_seconds = 2.5
+        time.sleep(min(sleep_seconds, max(0.2, remaining)))
     raise RuntimeError("Timed out while waiting for a new OpenAI verification email")
 
 
@@ -512,9 +553,15 @@ def clear_and_type(locator, value: str, description: str) -> None:
     log(f"Typed: {description}")
 
 
-def find_first_visible(page, selectors: list[str], timeout_ms: int = 2500):
+def find_first_visible(page, selectors: list[str], timeout_ms: int = 2500, stop_condition=None):
     deadline = time.time() + (timeout_ms / 1000)
     while time.time() < deadline:
+        if stop_condition is not None:
+            try:
+                if stop_condition():
+                    return None
+            except Exception:
+                pass
         for selector in selectors:
             locator = page.locator(selector).first
             try:
@@ -524,6 +571,45 @@ def find_first_visible(page, selectors: list[str], timeout_ms: int = 2500):
                 continue
         time.sleep(0.15)
     return None
+
+
+def wait_until(predicate, timeout_seconds: float, poll_seconds: float = 0.15):
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            result = predicate()
+            if result:
+                return result
+        except Exception:
+            pass
+        time.sleep(poll_seconds)
+    return None
+
+
+def wait_for_login_transition(page, timeout_seconds: float = 2.5) -> str | None:
+    return wait_until(
+        lambda: (
+            "error-page"
+            if page_shows_refresh_login_error(page)
+            else "password-visible"
+            if find_first_visible(
+                page,
+                [
+                    "input[type='password']",
+                    "input[name='password']",
+                    "input[autocomplete='current-password']",
+                ],
+                timeout_ms=1,
+            )
+            else "code-visible"
+            if get_visible_one_time_code_inputs(page) and page_requests_email_code(page)
+            else "consent-visible"
+            if page_shows_codex_consent(page)
+            else None
+        ),
+        timeout_seconds=timeout_seconds,
+        poll_seconds=0.15,
+    )
 
 
 def press_submit(page, description: str) -> None:
@@ -549,6 +635,14 @@ def press_submit(page, description: str) -> None:
         return
     page.keyboard.press("Enter")
     log(f"Pressed Enter: {description}")
+
+
+def oauth_page_ready(page) -> bool:
+    try:
+        body_text = page.locator("body").inner_text(timeout=1500)
+    except Exception:
+        return False
+    return "Codex OAuth" in body_text
 
 
 def ensure_management_login(page, management_key: str) -> None:
@@ -578,14 +672,25 @@ def ensure_management_login(page, management_key: str) -> None:
         if not login_button:
             raise RuntimeError("Could not find management login button")
         human_click(login_button, "management login")
-        page.wait_for_timeout(2500)
+        page.wait_for_timeout(1200)
         log("Management page logged in")
 
 
 def open_oauth_page(page) -> None:
+    if "#/oauth" in page.url and oauth_page_ready(page):
+        log("OAuth page is ready")
+        return
     page.evaluate("window.location.hash = '#/oauth'")
-    page.wait_for_timeout(2500)
-    body_text = page.locator("body").inner_text(timeout=30000)
+    body_text = wait_until(
+        lambda: (
+            text
+            if "Codex OAuth" in (text := page.locator("body").inner_text(timeout=3000).strip())
+            else ""
+        ),
+        timeout_seconds=8.0,
+        poll_seconds=0.2,
+    )
+    body_text = body_text or ""
     if "Codex OAuth" not in body_text:
         raise RuntimeError("OAuth page did not load correctly")
     log("OAuth page is ready")
@@ -606,16 +711,18 @@ def click_codex_oauth_login(page) -> str:
     result = page.evaluate(script)
     if not result or not result.get("ok"):
         raise RuntimeError(f"Failed to click Codex OAuth login: {result}")
-    page.wait_for_timeout(1500)
-
-    auth_url = page.evaluate(
-        """
-        (() => {
-          const text = document.body.innerText || '';
-          const match = text.match(/https:\\/\\/auth\\.openai\\.com\\S+/);
-          return match ? match[0] : '';
-        })()
-        """
+    auth_url = wait_until(
+        lambda: page.evaluate(
+            """
+            (() => {
+              const text = document.body.innerText || '';
+              const match = text.match(/https:\\/\\/auth\\.openai\\.com\\S+/);
+              return match ? match[0] : '';
+            })()
+            """
+        ),
+        timeout_seconds=6.0,
+        poll_seconds=0.2,
     )
     if not auth_url:
         raise RuntimeError("Codex OAuth auth URL did not appear")
@@ -643,6 +750,10 @@ def wait_for_auth_page_ready(page, timeout_seconds: float = 90.0) -> None:
         except Exception:
             pass
 
+        if page_shows_refresh_login_error(page):
+            log("OpenAI auth page is showing the timeout/error page")
+            return
+
         waiting_markers = (
             "Just a moment",
             "请稍候",
@@ -652,7 +763,7 @@ def wait_for_auth_page_ready(page, timeout_seconds: float = 90.0) -> None:
         if not any(marker in title or marker in body for marker in waiting_markers):
             return
         log("OpenAI auth page is still in security check, waiting...")
-        time.sleep(2.0)
+        time.sleep(1.2)
     raise RuntimeError("OpenAI auth page stayed on the security-check screen for too long")
 
 
@@ -667,6 +778,7 @@ def maybe_fill_email(page, email: str) -> None:
             "input[inputmode='email']",
         ],
         timeout_ms=8000,
+        stop_condition=lambda: page_shows_refresh_login_error(page),
     )
     if not email_locator:
         continue_with_email = find_first_visible(
@@ -680,10 +792,11 @@ def maybe_fill_email(page, email: str) -> None:
                 "[role='button']:has-text('email')",
             ],
             timeout_ms=5000,
+            stop_condition=lambda: page_shows_refresh_login_error(page),
         )
         if continue_with_email:
             human_click(continue_with_email, "continue with email")
-            page.wait_for_timeout(2500)
+            page.wait_for_timeout(1000)
             email_locator = find_first_visible(
                 page,
                 [
@@ -694,6 +807,7 @@ def maybe_fill_email(page, email: str) -> None:
                     "input[inputmode='email']",
                 ],
                 timeout_ms=8000,
+                stop_condition=lambda: page_shows_refresh_login_error(page),
             )
     if not email_locator:
         return
@@ -709,10 +823,10 @@ def maybe_fill_email(page, email: str) -> None:
 
     clear_and_type(email_locator, email, "OpenAI email")
     press_submit(page, "submit email")
-    page.wait_for_timeout(2500)
+    wait_for_login_transition(page, timeout_seconds=2.5)
 
 
-def maybe_fill_password(page, password: str) -> bool:
+def maybe_fill_password(page, password: str, timeout_ms: int = 8000) -> bool:
     password_locator = find_first_visible(
         page,
         [
@@ -720,14 +834,15 @@ def maybe_fill_password(page, password: str) -> bool:
             "input[name='password']",
             "input[autocomplete='current-password']",
         ],
-        timeout_ms=12000,
+        timeout_ms=timeout_ms,
+        stop_condition=lambda: page_shows_refresh_login_error(page),
     )
     if not password_locator:
         return False
 
     clear_and_type(password_locator, password, "OpenAI password")
     press_submit(page, "submit password")
-    page.wait_for_timeout(2500)
+    wait_for_login_transition(page, timeout_seconds=2.5)
     return True
 
 
@@ -804,11 +919,24 @@ def maybe_fill_email_verification_code(
         digits = list(code.strip())
         for index, digit in enumerate(digits[: len(code_inputs)]):
             clear_and_type(code_inputs[index], digit, f"verification digit {index + 1}")
-        page.wait_for_timeout(1200)
+        page.wait_for_timeout(700)
     else:
         clear_and_type(code_inputs[0], code, "OpenAI verification code")
     press_submit(page, "submit verification code")
-    page.wait_for_timeout(2500)
+    page.wait_for_timeout(800)
+    wait_until(
+        lambda: (
+            "error-page"
+            if page_shows_refresh_login_error(page)
+            else "consent-visible"
+            if page_shows_codex_consent(page)
+            else "code-cleared"
+            if not get_visible_one_time_code_inputs(page) or not page_requests_email_code(page)
+            else None
+        ),
+        timeout_seconds=6.0,
+        poll_seconds=0.2,
+    )
     return updated_ids
 
 
@@ -831,6 +959,7 @@ def maybe_accept_consent(page) -> bool:
                 "div[role='button']:has-text('继续')",
             ],
             timeout_ms=2500,
+            stop_condition=lambda: page_shows_refresh_login_error(page),
         )
         if not consent_button:
             return False
@@ -838,9 +967,76 @@ def maybe_accept_consent(page) -> bool:
             label = consent_button.inner_text(timeout=1000).strip() or "consent button"
         except Exception:
             label = "consent button"
+        before_url = page.url
         human_click(consent_button, label)
-        page.wait_for_timeout(2500)
-        return True
+        progress = wait_until(
+            lambda: (
+                "error-page"
+                if page_shows_refresh_login_error(page)
+                else "url-changed"
+                if page.url != before_url
+                else "consent-cleared"
+                if not page_shows_codex_consent(page)
+                else None
+            ),
+            timeout_seconds=1.8,
+            poll_seconds=0.15,
+        )
+        if progress:
+            log(f"Consent click progressed immediately: {progress}")
+            return True
+
+        log("Consent click did not advance the page yet, trying a DOM click")
+        try:
+            consent_button.evaluate("(el) => el.click()")
+        except Exception:
+            pass
+
+        progress = wait_until(
+            lambda: (
+                "error-page"
+                if page_shows_refresh_login_error(page)
+                else "url-changed"
+                if page.url != before_url
+                else "consent-cleared"
+                if not page_shows_codex_consent(page)
+                else None
+            ),
+            timeout_seconds=1.5,
+            poll_seconds=0.15,
+        )
+        if progress:
+            log(f"Consent DOM click progressed: {progress}")
+            return True
+
+        log("Consent DOM click did not advance the page yet, trying a force click")
+        try:
+            consent_button.click(timeout=5000, force=True)
+        except Exception:
+            try:
+                page.keyboard.press("Enter")
+            except Exception:
+                pass
+
+        progress = wait_until(
+            lambda: (
+                "error-page"
+                if page_shows_refresh_login_error(page)
+                else "url-changed"
+                if page.url != before_url
+                else "consent-cleared"
+                if not page_shows_codex_consent(page)
+                else None
+            ),
+            timeout_seconds=1.8,
+            poll_seconds=0.15,
+        )
+        if progress:
+            log(f"Consent force click progressed: {progress}")
+            return True
+
+        log("Consent page is still unchanged after click attempts")
+        return False
     return False
 
 
@@ -868,34 +1064,109 @@ def retry_codex_consent_if_needed(page, retry_index: int) -> bool:
     return maybe_accept_consent(page)
 
 
+def page_shows_refresh_login_error(page) -> bool:
+    try:
+        body_text = page.locator("body").inner_text(timeout=3000)
+    except Exception:
+        return False
+
+    lowered = body_text.lower()
+    marker_groups = [
+        ("糟糕，出错了", "operation timed out"),
+        ("糟糕，出错了", "重试"),
+        ("something went wrong", "operation timed out"),
+        ("something went wrong", "retry"),
+        ("there was a problem", "retry"),
+        ("出错了", "重试"),
+        ("出错了", "operation timed out"),
+    ]
+    for left, right in marker_groups:
+        if (left in body_text or left in lowered) and (right in body_text or right in lowered):
+            return True
+    return False
+
+
+def refresh_openai_login_page(page, auth_url: str, retry_index: int, retry_limit: int) -> None:
+    log(f"Detected OpenAI timeout/error page, refreshing and retrying login ({retry_index}/{retry_limit})")
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=60000)
+    except Exception:
+        page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(1200)
+
+
 def complete_openai_login(
     page,
     account: Account,
     duckmail_token: str | None,
     duckmail_api_base: str,
     seen_duckmail_ids: set[str],
+    login_retry_limit: int = 2,
 ) -> set[str]:
-    page.bring_to_front()
-    page.wait_for_timeout(2000)
-    wait_for_auth_page_ready(page)
-    maybe_fill_email(page, account.email)
-    if not maybe_fill_password(page, account.password):
-        wait_for_auth_page_ready(page, timeout_seconds=20.0)
-        if not maybe_fill_password(page, account.password):
-            raise RuntimeError("Could not find the OpenAI password field")
+    auth_url = page.url
 
-    for _ in range(6):
-        updated_ids = maybe_fill_email_verification_code(
-            page=page,
-            duckmail_token=duckmail_token,
-            duckmail_api_base=duckmail_api_base,
-            seen_duckmail_ids=seen_duckmail_ids,
-        )
-        code_used = updated_ids != seen_duckmail_ids
-        seen_duckmail_ids = updated_ids
-        consent_clicked = maybe_accept_consent(page)
-        if not code_used and not consent_clicked:
-            break
+    for retry_index in range(login_retry_limit + 1):
+        page.bring_to_front()
+        page.wait_for_timeout(1200)
+        wait_for_auth_page_ready(page)
+        if page_shows_refresh_login_error(page):
+            if retry_index >= login_retry_limit:
+                raise RuntimeError("OpenAI kept showing the refresh-and-sign-in-again error after 2 retries")
+            refresh_openai_login_page(page, auth_url, retry_index + 1, login_retry_limit)
+            continue
+        maybe_fill_email(page, account.email)
+        if page_shows_refresh_login_error(page):
+            if retry_index >= login_retry_limit:
+                raise RuntimeError("OpenAI kept showing the refresh-and-sign-in-again error after 2 retries")
+            refresh_openai_login_page(page, auth_url, retry_index + 1, login_retry_limit)
+            continue
+
+        if not maybe_fill_password(page, account.password, timeout_ms=7000):
+            if page_shows_refresh_login_error(page):
+                if retry_index >= login_retry_limit:
+                    raise RuntimeError("OpenAI kept showing the refresh-and-sign-in-again error after 2 retries")
+                refresh_openai_login_page(page, auth_url, retry_index + 1, login_retry_limit)
+                continue
+            wait_for_auth_page_ready(page, timeout_seconds=8.0)
+            if not maybe_fill_password(page, account.password, timeout_ms=5000):
+                raise RuntimeError("Could not find the OpenAI password field")
+        if page_shows_refresh_login_error(page):
+            if retry_index >= login_retry_limit:
+                raise RuntimeError("OpenAI kept showing the refresh-and-sign-in-again error after 2 retries")
+            refresh_openai_login_page(page, auth_url, retry_index + 1, login_retry_limit)
+            continue
+
+        retry_requested = False
+        for _ in range(6):
+            updated_ids = maybe_fill_email_verification_code(
+                page=page,
+                duckmail_token=duckmail_token,
+                duckmail_api_base=duckmail_api_base,
+                seen_duckmail_ids=seen_duckmail_ids,
+            )
+            code_used = updated_ids != seen_duckmail_ids
+            seen_duckmail_ids = updated_ids
+
+            if page_shows_refresh_login_error(page):
+                retry_requested = True
+                break
+
+            consent_clicked = maybe_accept_consent(page)
+            if page_shows_refresh_login_error(page):
+                retry_requested = True
+                break
+
+            if not code_used and not consent_clicked:
+                break
+
+        if retry_requested:
+            if retry_index >= login_retry_limit:
+                raise RuntimeError("OpenAI kept showing the refresh-and-sign-in-again error after 2 retries")
+            refresh_openai_login_page(page, auth_url, retry_index + 1, login_retry_limit)
+            continue
+
+        return seen_duckmail_ids
+
     return seen_duckmail_ids
 
 
@@ -913,6 +1184,7 @@ def wait_for_oauth_completion(
     continue_retries_used = 0
     last_retry_at = 0.0
     while time.time() < deadline:
+        consent_visible = auth_page is not None and page_shows_codex_consent(auth_page)
         status, error = fetch_auth_status(base_url, management_key, state)
         log(f"OAuth status: {status or 'unknown'}")
         if status in {"ok", "success", "done"}:
@@ -924,13 +1196,13 @@ def wait_for_oauth_completion(
             status == "wait"
             and auth_page is not None
             and continue_retries_used < continue_retry_limit
-            and time.time() - last_retry_at >= 4.0
+            and time.time() - last_retry_at >= (1.6 if consent_visible else 4.0)
         ):
             try:
                 if retry_codex_consent_if_needed(auth_page, continue_retries_used + 1):
                     continue_retries_used += 1
                     last_retry_at = time.time()
-                    time.sleep(2.5)
+                    time.sleep(1.0)
                     continue
             except Exception as exc:
                 log(f"Consent retry check failed: {exc}")
@@ -939,10 +1211,10 @@ def wait_for_oauth_completion(
             status == "wait"
             and auth_page is not None
             and continue_retries_used >= continue_retry_limit
-            and page_shows_codex_consent(auth_page)
+            and consent_visible
         ):
             raise RuntimeError("Clicked Continue 3 times total, but the Codex consent page is still not progressing")
-        time.sleep(3.0)
+        time.sleep(1.2 if consent_visible else 3.0)
     raise RuntimeError(f"OAuth status did not complete within {timeout_seconds}s")
 
 
@@ -1016,6 +1288,8 @@ def print_batch_summary(
     failure_count: int,
     skipped_processed_count: int,
     skipped_failed_count: int,
+    total_elapsed_seconds: float,
+    average_account_elapsed_seconds: float,
 ) -> None:
     success_rate = (success_count / selected_count * 100.0) if selected_count else 0.0
     print("\n" + "=" * 52, flush=True)
@@ -1028,6 +1302,8 @@ def print_batch_summary(
     print(f"成功数: {success_count}", flush=True)
     print(f"失败数: {failure_count}", flush=True)
     print(f"成功率: {success_rate:.2f}%", flush=True)
+    print(f"总处理耗时: {format_duration(total_elapsed_seconds)}", flush=True)
+    print(f"单账号平均耗时: {format_duration(average_account_elapsed_seconds)}", flush=True)
     print("=" * 52, flush=True)
 
 
@@ -1191,11 +1467,16 @@ def process_account_task(
     account: Account,
     chrome_path: Path,
     active_limit: int,
-) -> tuple[Account, Path | None]:
+) -> tuple[Account, Path | None, float]:
     mark_task_started(account, active_limit)
+    started_at = time.perf_counter()
     try:
         newest_auth = run_account_flow(args, account, chrome_path)
-        return account, newest_auth
+        elapsed_seconds = time.perf_counter() - started_at
+        return account, newest_auth, elapsed_seconds
+    except Exception as exc:
+        elapsed_seconds = time.perf_counter() - started_at
+        raise AccountTaskError(account, exc, elapsed_seconds) from exc
     finally:
         mark_task_finished(active_limit)
 
@@ -1219,12 +1500,17 @@ def main() -> int:
             failure_count=0,
             skipped_processed_count=skipped_processed_count,
             skipped_failed_count=skipped_failed_count,
+            total_elapsed_seconds=0.0,
+            average_account_elapsed_seconds=0.0,
         )
         return 0
 
     log(f"Accounts selected this run: {len(selected_accounts)}")
     failures: list[str] = []
     success_count = 0
+    batch_started_at = time.perf_counter()
+    total_account_elapsed_seconds = 0.0
+    handled_account_count = 0
     max_workers = prompt_parallel_workers(args.max_workers, len(selected_accounts))
     log(f"Parallel workers: {max_workers}")
     reset_active_task_counter()
@@ -1240,16 +1526,31 @@ def main() -> int:
         for future in as_completed(future_to_account):
             account = future_to_account[future]
             try:
-                _, newest_auth = future.result()
+                _, newest_auth, elapsed_seconds = future.result()
+                handled_account_count += 1
+                total_account_elapsed_seconds += elapsed_seconds
                 mark_account_processed(accounts_file, account)
                 log(f"Marked processed: line {account.line_number}")
                 if newest_auth:
                     log(f"Completed line {account.line_number} with auth file: {newest_auth}")
+                log(f"Elapsed line {account.line_number}: {format_duration(elapsed_seconds)}")
                 success_count += 1
+            except AccountTaskError as exc:
+                handled_account_count += 1
+                total_account_elapsed_seconds += exc.elapsed_seconds
+                log(f"FAILED line {account.line_number} ({mask_email(account.email)}): {exc.original_exception}")
+                mark_account_failed(accounts_file, account)
+                log(f"Marked failed: line {account.line_number}")
+                log(f"Elapsed line {account.line_number}: {format_duration(exc.elapsed_seconds)}")
+                failures.append(account.email)
+                if args.stop_on_error:
+                    stop_after_failure = True
+                    break
             except Exception as exc:
                 log(f"FAILED line {account.line_number} ({mask_email(account.email)}): {exc}")
                 mark_account_failed(accounts_file, account)
                 log(f"Marked failed: line {account.line_number}")
+                log(f"Elapsed line {account.line_number}: {format_duration(0.0)}")
                 failures.append(account.email)
                 if args.stop_on_error:
                     stop_after_failure = True
@@ -1263,6 +1564,11 @@ def main() -> int:
                 if cancelled:
                     log(f"Cancelled pending line {account.line_number}: {mask_email(account.email)}")
 
+    batch_elapsed_seconds = time.perf_counter() - batch_started_at
+    average_account_elapsed_seconds = (
+        total_account_elapsed_seconds / handled_account_count if handled_account_count else 0.0
+    )
+
     print_batch_summary(
         total_accounts=total_accounts,
         selected_count=len(selected_accounts),
@@ -1270,6 +1576,8 @@ def main() -> int:
         failure_count=len(failures),
         skipped_processed_count=skipped_processed_count,
         skipped_failed_count=skipped_failed_count,
+        total_elapsed_seconds=batch_elapsed_seconds,
+        average_account_elapsed_seconds=average_account_elapsed_seconds,
     )
 
     if failures:
